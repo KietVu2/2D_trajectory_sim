@@ -19,8 +19,7 @@ class Params:
     wind_z: float = 0.0     # wind speed m/s in  z-dir (positive = tailwind)
     g: float = 9.81         #gravity, m/s^2
     y0: float = 50.0         #release height m
-
-
+    T: float = 287.05       #Temperature, Kelvin
 
 def initial_velocity(p: Params):
     elevation_theta = np.radians(p.elevation_deg)
@@ -28,7 +27,15 @@ def initial_velocity(p: Params):
     vx_int, vy_int, vz_int = [p.speed * np.cos(elevation_theta) * np.cos(azimuth_theta), p.speed * np.sin(elevation_theta),
                               p.speed*np.sin(azimuth_theta) * np.cos(elevation_theta)]
     return vx_int, vy_int, vz_int
+#------------Value Functions------------
+mu = lambda T: 1.716e-5 * (T/273.15)**1.5 * (273.15 + 110.4) / (T + 110.4)
 
+def cd_sphere(Re):
+    """Morrison (2013) sphere drag correlation."""
+    return (24/Re
+            + 2.6*(Re/5) / (1 + (Re/5)**1.52)
+            + 0.411*(Re/263000)**-7.94 / (1 + (Re/263000)**-8)
+            + 0.25*(Re/1e6) / (1 + Re/1e6))
 #------------ ODE Solver-----------------
 
 def simulate(p: Params):
@@ -41,6 +48,9 @@ def simulate(p: Params):
         vy_rel = vy - p.wind_y
         vz_rel = vz - p.wind_z
         v_rel = np.sqrt(vx_rel**2 + vy_rel**2 + vz_rel**2)
+        D = np.sqrt(4 * p.A / np.pi)         
+        Re = rho * v_rel * D / mu(p.T)             
+        Cd = cd_sphere(Re)
         F_drag = 0.5 * rho * v_rel**2 * p.Cd * p.A
 
         if v_rel > 0:
