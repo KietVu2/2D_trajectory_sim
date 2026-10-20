@@ -4,19 +4,22 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize_scalar
 import matplotlib
-matplotlib.use("QtAgg")
+import plotly.graph_objects as go
+matplotlib.use("TkAgg")
+import pyvista as pv
+
 # ---------- Launch Conditions --------------- 
 @dataclass(frozen = True)
 class Params:
     speed: float = 15.0       # launch speed, m/s
     elevation_deg: float = 0.0  #xy angle
     azimuth_deg: float = 0.0   #xz angle 
-    Cd: float = 0.3         # drag coefficient
+    Cd: float | None = 0.3     #Default drag coefficient 
     A: float = 0.05         # cross-sectional area, m^2
     m: float = 4.0          # mass, kg
     wind_x: float = 0.0     # wind speed m/s in  x-dir (positive = tailwind)
     wind_y: float = 0.0     # wind speed m/s in  y-dir (positive = updraft)
-    wind_z: float = 0.0     # wind speed m/s in  z-dir (positive = tailwind)
+    wind_z: float = 0.0     # wind speed m/s in  z-dir (positive = towards +z)
     g: float = 9.81         #gravity, m/s^2
     y0: float = 50.0         #release height m
     T: float = 287.05       #Temperature, Kelvin
@@ -36,33 +39,27 @@ def cd_sphere(Re):
             + 2.6*(Re/5) / (1 + (Re/5)**1.52)
             + 0.411*(Re/263000)**-7.94 / (1 + (Re/263000)**-8)
             + 0.25*(Re/1e6) / (1 + Re/1e6))
+
+def drag_coefficient(p: Params, rho, v_rel):
+    if p.Cd is not None:                 
+        return p.Cd
+    D = np.sqrt(4 * p.A / np.pi)         
+    Re = max(rho * v_rel * D / mu(p.T), 1e-6)
+    return cd_sphere(Re)
 #------------ ODE Solver-----------------
 
 def simulate(p: Params):
     vx0, vy0, vz0 = initial_velocity(p)
     initial_cond = [0.0, p.y0, 0.0, vx0, vy0, vz0]
-    def flight_dynamics(t, cond):
-        x, y, z, vx, vy, vz = cond
-        rho = 1.225 * np.exp(-y/8500)
-        vx_rel = vx - p.wind_x
-        vy_rel = vy - p.wind_y
-        vz_rel = vz - p.wind_z
-        v_rel = np.sqrt(vx_rel**2 + vy_rel**2 + vz_rel**2)
-        D = np.sqrt(4 * p.A / np.pi)         
-        Re = rho * v_rel * D / mu(p.T)             
-        Cd = cd_sphere(Re)
-        F_drag = 0.5 * rho * v_rel**2 * p.Cd * p.A
 
-        if v_rel > 0:
-            ax = -(F_drag/p.m) * (vx_rel/v_rel)
-            ay = -p.g - (F_drag/p.m) * (vy_rel/v_rel) 
-            az = -(F_drag/p.m) * (vz_rel/v_rel)
-        else:
-            ax = 0
-            ay = -p.g
-            az = 0
-
-        return [vx, vy, vz, ax, ay, az]
+    def flight_dynamics(t, s):
+        x, y, z, vx, vy, vz = s
+        rho = 1.225 * np.exp(-y / 8500)
+        rvx, rvy, rvz = vx - p.wind_x, vy - p.wind_y, vz - p.wind_z
+        v_rel = np.sqrt(rvx**2 + rvy**2 + rvz**2)
+        k = 0.5 * rho * drag_coefficient(p, rho, v_rel) * p.A / p.m * v_rel
+        return [vx, vy, vz, -k * rvx, -p.g - k * rvy, -k * rvz]
+    
     def hit_ground(t, cond):
         return cond[1]
 
@@ -126,7 +123,15 @@ def ballistic_checker():
     range2 = solve_summarize(simulate(scaled))["range"]
     if not np.isclose(range1, range2, rtol = 1e-6):
         raise RuntimeError("The scaling between mass and area is incorrect")
-
+    
+def check_terminal_velocity_drop():
+    p = Params(speed=0.0, elevation_deg=0.0, Cd=0.3, y0=50.0)
+    T = simulate(p).t[-1]
+    rho = 1.225 * np.exp(-p.y0 / 2 / 8500)          # mid-drop density
+    vt = np.sqrt(2 * p.m * p.g / (rho * p.Cd * p.A))
+    fall = vt**2 / p.g * np.log(np.cosh(p.g * T / vt))  # analytic quadratic-drag fall distance
+    if not np.isclose(fall, p.y0, rtol=1e-2):
+        raise RuntimeError(f"Drop check FAILED: analytic fall {fall:.3f} m vs y0 {p.y0} m")
 #------------ Angle Optimization-----------------
 def range_at_cond(angle_deg, base: Params):
     return solve_summarize(simulate(replace(base, elevation_deg=angle_deg)))["range"]
@@ -143,47 +148,76 @@ def find_optimal_angle(base: Params):
         raise ValueError(f"Best angle {res.x:.2f} deg is at the edge of ({low}, {high})")
     return res.x, -res.fun
 #----------- Plotting ------------------
-def plot_3d(base=None, traj_angles=(20, 30, 45, 60, 75), show_vacuum=True, n=100):    
-    check_against_vacuum()
-    ballistic_checker()
-    check_planar_symmetry()
-    check_crosswind_sign()
+COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2"]
+
+def dashed_line(points, dash=3, gap=2):
+    """Dashed polyline built as a single PolyData (no mesh merging)."""
+    idx = np.arange(len(points) - 1)
+    keep = idx[(idx % (dash + gap)) < dash]
+    cells = np.column_stack([np.full(len(keep), 2), keep, keep + 1]).ravel()
+    mesh = pv.PolyData(np.asarray(points, dtype=float))
+    mesh.lines = cells
+    return mesh
+
+def build_scene(pl, base, traj_angles, show_vacuum, n):
+    pl.set_background("white")
+    legend = []
+    for i, a in enumerate(traj_angles):
+        c = COLORS[i % len(COLORS)]
+        p = replace(base, elevation_deg=a)
+
+        sol = simulate(p)
+        t = np.linspace(0, sol.t[-1], n)
+        x, y, z = sol.sol(t)[:3]
+        pts = np.column_stack([x, -z, y])      # y (height) -> vertical axis
+        pl.add_mesh(pv.lines_from_points(pts), color=c, line_width=3)
+        pl.add_mesh(pv.PolyData(pts[-1:]), color=c, point_size=10,
+                    render_points_as_spheres=True)
+        legend.append([f"{a}°", c])
+
+        if show_vacuum:                        # one vacuum curve per angle
+            vx0, vy0, vz0 = initial_velocity(p)
+            t_vac = (vy0 + np.sqrt(vy0**2 + 2 * p.g * p.y0)) / p.g
+            tv = np.linspace(0, t_vac, n)
+            vac = np.column_stack([vx0 * tv, vz0 * tv,
+                                   p.y0 + vy0 * tv - 0.5 * p.g * tv**2])
+            pl.add_mesh(dashed_line(vac), color=c, line_width=2, opacity=0.6)
+
+    if show_vacuum:
+        legend.append(["vacuum (dashed)", "gray"])
+
+    pl.show_bounds(xtitle="x downrange (m)", ytitle="z crossrange (m)",
+                   ztitle="y height (m)", color="black")
+    pl.add_legend(legend, bcolor="white", border=True)
+    pl.add_title("3D trajectories (solid: drag + wind, dashed: vacuum)",
+                 font_size=10, color="black")
+    pl.view_isometric()
+
+def plot_3d(base=None, traj_angles=(20, 30, 45, 60, 75), show_vacuum=True, n=100,
+            save_path="projectile_sweep_3d.png", show=True, run_checks=True):
+    if run_checks:
+        check_against_vacuum()
+        ballistic_checker()
+        check_planar_symmetry()
+        check_crosswind_sign()
 
     if base is None:
         base = Params(azimuth_deg=20.0, wind_z=3.0)
 
-    fig = plt.figure(figsize=(9, 7))
-    ax = fig.add_subplot(projection="3d")
-    xs, ys, zs = [], [], []
+    size = (1100, 800)
 
-    for a in traj_angles:
-        p = replace(base, elevation_deg=a)
-        sol = simulate(p)
-        t = np.linspace(0, sol.t[-1], n)
-        x, y, z = sol.sol(t)[:3]
+    if save_path:                              # reliable save, always off-screen
+        pl = pv.Plotter(window_size=size, off_screen=True)
+        build_scene(pl, base, traj_angles, show_vacuum, n)
+        pl.screenshot(save_path)
+        pl.close()
 
-        line, = ax.plot(x, z, y, label=f"{a}°")
-        ax.scatter(x[-1], z[-1], 0, color=line.get_color(), s=20)  # landing point
-
-    if show_vacuum:
-        vx0, vy0, vz0 = initial_velocity(p)
-        t_vac = (vy0 + np.sqrt(vy0**2 + 2 * p.g * p.y0)) / p.g
-        tv = np.linspace(0, t_vac, n)
-        xv, zv = vx0 * tv, vz0 * tv
-        yv = p.y0 + vy0 * tv - 0.5 * p.g * tv**2
-        ax.plot(xv, zv, yv, "--", color=line.get_color(), alpha=0.5)
-        xs.append(xv); ys.append(yv); zs.append(zv)
-    xs.append(xv); ys.append(yv); zs.append(zv)
-
-    spans = [max(np.ptp(np.concatenate(v)), 1.0) for v in (xs, zs, ys)]
-    ax.set_box_aspect(spans)
-
-    ax.set(xlabel="x downrange (m)", ylabel="z crossrange (m)", zlabel="y height (m)",
-           title="3D trajectories (solid: drag + wind, dashed: vacuum)")
-    ax.legend(title="Elevation")
-    fig.tight_layout()
-    fig.savefig("projectile_3d.png", dpi=150)
-    plt.show()
-        
+    if show:                                   # interactive native window
+        pl = pv.Plotter(window_size=size)
+        build_scene(pl, base, traj_angles, show_vacuum, n)
+        target = save_path or "projectile_view.png"
+        pl.add_key_event("s", lambda: pl.screenshot(target))  # saves current view
+        pl.show()
+   
 if __name__ == "__main__":
         plot_3d()
