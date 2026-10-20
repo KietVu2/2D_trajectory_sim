@@ -1,6 +1,38 @@
-![Trajectories and range vs. launch angle](Projects/projectile_sweep.png)
-Predicts the ballistic trajectory of objects launched into the air, with and without drag. Change the parameters for desired object, and then play the terminal. Current Assumptions: constant wind, quadratic drag, and exponential air density. The altitude doesn't change much, need a very drastic climb for rho to significantly be effected. Has checks written for bounded angle, and if wind direction is incorrect
-For 3D, added a check for planar symmetry and crosswind signs
-Added a 3D graph
-Fixed the 3D graph, as well as the flight_dynamics function. There was incorrect physics and possible edge case of division via 0
-Also added a drag force checker, to make sure the magnitudes are correct
+# 3D Projectile (Drone Dropper) Simulation
+
+Predicts the ballistic trajectory of an object launched or dropped into the air, with and without drag.
+
+![Trajectories and range vs. launch angle](projectile_sweep.png)
+![Trajectories of 3D path](projectile_sweep_3d.png)
+
+## Usage
+
+1. Edit the parameters in `Params` for your object (speed, angles, mass, area, drag coefficient, wind, release height).
+2. Run the script from your terminal or IDE:
+
+```bash
+python 3D_drone_dropper.py
+python 2D_drone_dropper.py
+```
+
+## Assumptions
+
+- Constant wind
+- Quadratic drag
+- Exponential air density. Altitude changes little, and it takes a drastic climb for density (rho) to be significantly affected.
+
+## Validation Checks
+
+- **Vacuum check:** with `Cd = 0`, the numeric result matches the analytic solution
+- **Angle bounds:** the optimal launch angle must not land on the edge of the search range
+- **Crosswind sign:** positive and negative crosswinds push the projectile in opposite directions, and mirror each other
+- **Planar symmetry (3D):** with no crosswind and zero azimuth, there is no crossrange drift
+- **Drag force magnitude:** a drop from rest is compared against the analytic quadratic-drag solution
+
+## Changelog
+
+- Added a 3D graph
+- Fixed the 3D graph
+- Fixed `flight_dynamics`: corrected the drag physics and removed a possible divide-by-zero edge case
+- Added the planar symmetry and crosswind sign checks
+- Added the drag force checker
