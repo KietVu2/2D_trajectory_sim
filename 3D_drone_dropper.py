@@ -3,11 +3,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.optimize import minimize_scalar
-import matplotlib
 import plotly.graph_objects as go
-matplotlib.use("TkAgg")
 import pyvista as pv
 
+#----------- Physical Constants --------------
+R_AIR = 287.05         # specific gas constant of dry air, J/(kg*K)
+P0 = 101325.0          # standard sea-level pressure, Pa
 # ---------- Launch Conditions --------------- 
 @dataclass(frozen = True)
 class Params:
@@ -22,7 +23,7 @@ class Params:
     wind_z: float = 0.0     # wind speed m/s in  z-dir (positive = towards +z)
     g: float = 9.81         #gravity, m/s^2
     y0: float = 50.0         #release height m
-    T: float = 287.05       #Temperature, Kelvin
+    T: float = 288.15       #Temperature of sea level, Kelvin 
 
 def initial_velocity(p: Params):
     elevation_theta = np.radians(p.elevation_deg)
@@ -39,6 +40,13 @@ def cd_sphere(Re):
             + 2.6*(Re/5) / (1 + (Re/5)**1.52)
             + 0.411*(Re/263000)**-7.94 / (1 + (Re/263000)**-8)
             + 0.25*(Re/1e6) / (1 + Re/1e6))
+def air_density(y, p: Params):
+    """Isothermal atmosphere at temperature p.T (ideal gas law + hydrostatic balance).
+    rho0 = P0 / (R T) sets sea-level density; H = R T / g sets the scale height."""
+    rho0 = P0 / (R_AIR * p.T)
+    H = R_AIR * p.T / p.g
+    return rho0 * np.exp(-y / H)
+
 
 def drag_coefficient(p: Params, rho, v_rel):
     if p.Cd is not None:                 
@@ -54,7 +62,7 @@ def simulate(p: Params):
 
     def flight_dynamics(t, s):
         x, y, z, vx, vy, vz = s
-        rho = 1.225 * np.exp(-y / 8500)
+        rho = air_density(y, p)
         rvx, rvy, rvz = vx - p.wind_x, vy - p.wind_y, vz - p.wind_z
         v_rel = np.sqrt(rvx**2 + rvy**2 + rvz**2)
         k = 0.5 * rho * drag_coefficient(p, rho, v_rel) * p.A / p.m * v_rel
@@ -117,7 +125,7 @@ def check_crosswind_sign():
 
 #-------------- Ballistic Checker for Drag Force -----------------
 def ballistic_checker():
-    base = Params()
+    base = Params(Cd = 0.3)
     scaled = replace(base, A = base.A*2, m = base.m*2)
     range1 = solve_summarize(simulate(base))["range"]
     range2 = solve_summarize(simulate(scaled))["range"]
@@ -127,11 +135,20 @@ def ballistic_checker():
 def check_terminal_velocity_drop():
     p = Params(speed=0.0, elevation_deg=0.0, Cd=0.3, y0=50.0)
     T = simulate(p).t[-1]
-    rho = 1.225 * np.exp(-p.y0 / 2 / 8500)          # mid-drop density
+    rho = air_density(p.y0/2, p)         # mid-drop density
     vt = np.sqrt(2 * p.m * p.g / (rho * p.Cd * p.A))
     fall = vt**2 / p.g * np.log(np.cosh(p.g * T / vt))  # analytic quadratic-drag fall distance
     if not np.isclose(fall, p.y0, rtol=1e-2):
         raise RuntimeError(f"Drop check FAILED: analytic fall {fall:.3f} m vs y0 {p.y0} m")
+
+def check_density_temperature():
+    rho_standard = air_density(0.0, Params(T=288.15))
+    if not np.isclose(rho_standard, 1.225, rtol = 1e-3):
+        raise RuntimeError(f"Sea level density check FAILED, got {rho_standard:.4f}, not ~1.225")
+    rho_cold = air_density(0.0, Params(T = 240))
+    rho_hot = air_density(0.0, Params(T = 330))
+    if not rho_cold > rho_standard > rho_hot:
+        raise RuntimeError("Density should decrease as Temperature increases")
 #------------ Angle Optimization-----------------
 def range_at_cond(angle_deg, base: Params):
     return solve_summarize(simulate(replace(base, elevation_deg=angle_deg)))["range"]
@@ -179,7 +196,7 @@ def build_scene(pl, base, traj_angles, show_vacuum, n):
             vx0, vy0, vz0 = initial_velocity(p)
             t_vac = (vy0 + np.sqrt(vy0**2 + 2 * p.g * p.y0)) / p.g
             tv = np.linspace(0, t_vac, n)
-            vac = np.column_stack([vx0 * tv, vz0 * tv,
+            vac = np.column_stack([vx0 * tv, -vz0 * tv,
                                    p.y0 + vy0 * tv - 0.5 * p.g * tv**2])
             pl.add_mesh(dashed_line(vac), color=c, line_width=2, opacity=0.6)
 
@@ -200,6 +217,8 @@ def plot_3d(base=None, traj_angles=(20, 30, 45, 60, 75), show_vacuum=True, n=100
         ballistic_checker()
         check_planar_symmetry()
         check_crosswind_sign()
+        check_terminal_velocity_drop()
+        check_density_temperature()
 
     if base is None:
         base = Params(azimuth_deg=20.0, wind_z=3.0)
